@@ -49,6 +49,9 @@ make build-all                             # cross-compile all platforms
 - FTS5 queries must be quoted with `quoteFTSQuery()` to prevent operator injection
 - URL paths must be sanitized in `urlToFilePath()` to prevent directory traversal
 - URLs are normalized (query params/fragments stripped) to prevent duplicate crawls
+- Do NOT use a manual visited map for URL dedup — rely on colly's built-in dedup after normalization (a manual map causes race conditions with concurrent workers, turning BFS into DFS)
+- Proxy transport must restore `resp.Request` to the original request so colly sees the real URL, not the proxy URL
+- If `PROXY_BASE_URL` ends with `=`, append the encoded target directly (don't add another `url=`)
 - HTTP requests to external services must have timeouts
 - Signal handling uses atomic flags, not `os.Exit()`
 - Version info set via ldflags: `-X main.version -X main.commit -X main.date`

@@ -108,7 +108,7 @@ web2md version
 
 ## How it works
 
-1. **Crawl** - BFS crawl using [colly](https://github.com/gocolly/colly), same-domain + subdomains, respects robots.txt/llms.txt
+1. **Crawl** - Proper BFS crawl using [colly](https://github.com/gocolly/colly), same-domain + subdomains, respects robots.txt/llms.txt
 2. **Store** - HTML, PDFs, and images saved to `~/.web2md/data/{domain}/`, metadata in SQLite at `~/.web2md/db.sqlite`
 3. **Convert** - Markdown conversion via [go-readability](https://github.com/go-shiori/go-readability) + [html-to-markdown](https://github.com/JohannesKaufmann/html-to-markdown) (on by default)
 4. **Search** - FTS5 full-text search with BM25 ranking
@@ -125,17 +125,19 @@ web2md version
 
 ### Resume support
 
-Re-running a crawl on the same domain skips already-crawled URLs. Use `--recrawl` to force re-crawling:
+Re-running a crawl on the same domain re-fetches previously crawled pages for link discovery but only saves new pages. Use `--recrawl` to force re-crawling all pages:
 
 ```bash
 web2md https://example.com --recrawl
 ```
 
+When using a proxy (`PROXY_BASE_URL`), prefer `--recrawl` to avoid wasting proxy credits on resume fetches.
+
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `PROXY_BASE_URL` | Proxy service URL (e.g. crawlbase) |
+| `PROXY_BASE_URL` | Proxy service URL (e.g. `https://api.crawlbase.com/?token=TOKEN&url=`) |
 | `OPENAI_API_KEY` | Required for `--filter` and `--smart-md` |
 | `OPENAI_BASE_URL` | Custom OpenAI-compatible API endpoint |
 | `OPENAI_MODEL` | Model to use (default: `gpt-4o-mini`) |

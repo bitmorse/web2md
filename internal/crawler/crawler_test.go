@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"net/http"
 	"net/url"
 	"testing"
 )
@@ -128,4 +129,87 @@ func TestExtractTitle(t *testing.T) {
 			t.Errorf("extractTitle(%q) = %q, want %q", tt.html, got, tt.want)
 		}
 	}
+}
+
+func TestProxyTransportURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		proxyURL string
+		targetURL string
+		wantContains string
+		wantNotContains string
+	}{
+		{
+			name:            "proxy URL ending with url=",
+			proxyURL:        "https://api.crawlbase.com/?token=abc&url=",
+			targetURL:       "https://example.com/page",
+			wantContains:    "token=abc&url=https%3A%2F%2Fexample.com%2Fpage",
+			wantNotContains: "url=&url=",
+		},
+		{
+			name:         "proxy URL without url param",
+			proxyURL:     "https://proxy.example.com",
+			targetURL:    "https://example.com/page",
+			wantContains: "proxy.example.com?url=https%3A%2F%2Fexample.com%2Fpage",
+		},
+		{
+			name:         "proxy URL with query but no url=",
+			proxyURL:     "https://proxy.example.com?token=abc",
+			targetURL:    "https://example.com/page",
+			wantContains: "token=abc&url=https%3A%2F%2Fexample.com%2Fpage",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedURL string
+			transport := &proxyTransport{
+				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					capturedURL = req.URL.String()
+					return &http.Response{
+						StatusCode: 200,
+						Request:    req,
+					}, nil
+				}),
+				proxyURL: tt.proxyURL,
+			}
+
+			origReq, _ := http.NewRequest("GET", tt.targetURL, nil)
+			resp, err := transport.RoundTrip(origReq)
+			if err != nil {
+				t.Fatalf("RoundTrip error: %v", err)
+			}
+
+			if tt.wantContains != "" && !contains(capturedURL, tt.wantContains) {
+				t.Errorf("proxy URL %q does not contain %q", capturedURL, tt.wantContains)
+			}
+			if tt.wantNotContains != "" && contains(capturedURL, tt.wantNotContains) {
+				t.Errorf("proxy URL %q should not contain %q", capturedURL, tt.wantNotContains)
+			}
+
+			// Response should preserve the original URL for colly
+			if resp.Request.URL.String() != tt.targetURL {
+				t.Errorf("resp.Request.URL = %q, want original %q", resp.Request.URL.String(), tt.targetURL)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

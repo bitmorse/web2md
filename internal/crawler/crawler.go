@@ -86,7 +86,7 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	}
 
 	c := colly.NewCollector(
-		colly.URLFilters(regexp.MustCompile(`^https?://([a-zA-Z0-9-]+\.)*`+regexp.QuoteMeta(baseDomain)+`(/|$)`)),
+		colly.URLFilters(regexp.MustCompile(`^https?://([a-zA-Z0-9-]+\.)*`+regexp.QuoteMeta(baseDomain)+`(:\d+)?(/|$)`)),
 		colly.MaxDepth(opts.MaxDepth),
 	)
 
@@ -102,6 +102,7 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	}
 
 	if proxyURL := os.Getenv("PROXY_BASE_URL"); proxyURL != "" {
+		fmt.Printf("Using proxy: %s\n", proxyURL)
 		transport := &http.Transport{}
 		c.WithTransport(&proxyTransport{
 			base:     transport,
@@ -119,21 +120,12 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		atomic.StoreInt32(&stopped, 1)
 	}()
 
-	// Track normalized URLs to avoid crawling duplicates with different query params
-	visited := make(map[string]bool)
-	var visitedMu sync.Mutex
-
-	// Abort requests for already-crawled pages before the HTTP request is made
-	if !opts.Recrawl {
-		c.OnRequest(func(r *colly.Request) {
-			existing, _ := opts.DB.GetPage(r.URL.String())
-			if existing != nil && existing.Status == StatusCrawled {
-				fmt.Printf("  skipping %s (already crawled, use --recrawl to re-crawl)\n", r.URL)
-				r.Abort()
-			}
-		})
-	}
-
+	// Discover links on every page (including already-crawled ones on resume).
+	// We rely on colly's built-in dedup after URL normalization — no separate
+	// visited map is needed. Using a manual visited map caused a race condition
+	// where concurrent workers would mark URLs from child pages before the
+	// parent page finished processing its links, resulting in DFS-like depth
+	// chains instead of proper BFS.
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		if atomic.LoadInt32(&stopped) != 0 || int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
 			return
@@ -143,15 +135,6 @@ func Crawl(startURL string, opts CrawlOptions) error {
 			return
 		}
 		norm := normalizeURL(link)
-		visitedMu.Lock()
-		seen := visited[norm]
-		if !seen {
-			visited[norm] = true
-		}
-		visitedMu.Unlock()
-		if seen {
-			return
-		}
 		_ = e.Request.Visit(norm)
 	})
 
@@ -161,6 +144,17 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		}
 
 		pageURL := r.Request.URL.String()
+
+		// On resume (non-recrawl), skip saving already-crawled pages.
+		// OnHTML still fires for link discovery so new pages are found.
+		if !opts.Recrawl {
+			existing, _ := opts.DB.GetPage(pageURL)
+			if existing != nil && existing.Status == StatusCrawled {
+				fmt.Printf("  [skip] %s (already crawled, use --recrawl to re-crawl)\n", pageURL)
+				return
+			}
+		}
+
 		start := time.Now()
 		contentType := strings.ToLower(r.Headers.Get("Content-Type"))
 
@@ -450,19 +444,37 @@ type proxyTransport struct {
 }
 
 func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	origReq := req // preserve so colly sees the original URL
 	orig := req.URL.String()
-	separator := "&"
-	if !strings.Contains(t.proxyURL, "?") {
-		separator = "?"
+
+	// Build proxy URL: if the base already ends with "=" (e.g. "…&url="),
+	// just append the encoded target; otherwise add a url= parameter.
+	var proxyFull string
+	if strings.HasSuffix(t.proxyURL, "=") {
+		proxyFull = t.proxyURL + url.QueryEscape(orig)
+	} else {
+		separator := "&"
+		if !strings.Contains(t.proxyURL, "?") {
+			separator = "?"
+		}
+		proxyFull = t.proxyURL + separator + "url=" + url.QueryEscape(orig)
 	}
-	proxied, err := url.Parse(t.proxyURL + separator + "url=" + url.QueryEscape(orig))
+
+	proxied, err := url.Parse(proxyFull)
 	if err != nil {
 		return nil, err
 	}
 	req = req.Clone(req.Context())
 	req.URL = proxied
 	req.Host = proxied.Host
-	return t.base.RoundTrip(req)
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	// Restore the original request so colly's URL tracking, dedup, and
+	// URL filters see the real target URL — not the proxy URL.
+	resp.Request = origReq
+	return resp, nil
 }
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
