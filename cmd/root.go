@@ -69,6 +69,10 @@ Run with a URL to start crawling, or use subcommands for other operations.`,
 	},
 }
 
+func SetVersion(v string) {
+	rootCmd.Version = v
+}
+
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
