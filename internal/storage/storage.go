@@ -191,6 +191,85 @@ func quoteFTSQuery(query string) string {
 	return strings.Join(words, " ")
 }
 
+// DomainStats holds crawl statistics for a domain.
+type DomainStats struct {
+	Domain    string
+	Count     int
+	LastCrawl time.Time
+}
+
+// ListDomains returns all crawled domains with page counts.
+func (d *DB) ListDomains() ([]DomainStats, error) {
+	rows, err := d.db.Query(
+		`SELECT domain, COUNT(*), MAX(crawled_at) FROM pages WHERE status = 'crawled' GROUP BY domain ORDER BY domain`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []DomainStats
+	for rows.Next() {
+		var s DomainStats
+		var lastCrawl sql.NullString
+		if err := rows.Scan(&s.Domain, &s.Count, &lastCrawl); err != nil {
+			return nil, err
+		}
+		if lastCrawl.Valid {
+			s.LastCrawl = parseTime(lastCrawl.String)
+		}
+		stats = append(stats, s)
+	}
+	return stats, rows.Err()
+}
+
+// ListPages returns all crawled pages for a domain.
+func (d *DB) ListPages(domain string) ([]Page, error) {
+	rows, err := d.db.Query(
+		`SELECT id, url, domain, title, status, depth, html_path, md_path, md_method, crawled_at, filter_reason
+		 FROM pages WHERE domain = ? AND status = 'crawled' ORDER BY url`, domain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pages []Page
+	for rows.Next() {
+		var p Page
+		var crawledAt sql.NullTime
+		if err := rows.Scan(&p.ID, &p.URL, &p.Domain, &p.Title, &p.Status, &p.Depth,
+			&p.HTMLPath, &p.MDPath, &p.MDMethod, &crawledAt, &p.FilterReason); err != nil {
+			return nil, err
+		}
+		if crawledAt.Valid {
+			p.CrawledAt = crawledAt.Time
+		}
+		pages = append(pages, p)
+	}
+	return pages, rows.Err()
+}
+
+// parseTime tries common time formats stored by Go's time.Time in SQLite.
+func parseTime(s string) time.Time {
+	// Go's time.String() format: "2006-01-02 15:04:05.999999999 +0000 UTC m=+0.000000001"
+	// Strip monotonic clock suffix if present
+	if idx := strings.Index(s, " m="); idx != -1 {
+		s = s[:idx]
+	}
+	formats := []string{
+		"2006-01-02 15:04:05.999999999 +0000 UTC",
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		time.RFC3339,
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05+00:00",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 func (d *DB) CountPages(domain string) (int, error) {
 	var count int
 	var err error

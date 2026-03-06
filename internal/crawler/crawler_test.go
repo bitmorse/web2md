@@ -64,10 +64,11 @@ func TestShouldSkipURL(t *testing.T) {
 		// Fragment-only or javascript — skip
 		{"javascript:void(0)", true},
 		{"mailto:test@example.com", true},
-		// Common non-page extensions — skip
-		{"https://example.com/file.pdf", true},
-		{"https://example.com/image.jpg", true},
-		{"https://example.com/image.png", true},
+		// Downloadable files — don't skip (PDFs, images are saved)
+		{"https://example.com/file.pdf", false},
+		{"https://example.com/image.jpg", false},
+		{"https://example.com/image.png", false},
+		// Non-useful extensions — skip
 		{"https://example.com/archive.zip", true},
 		{"https://example.com/style.css", true},
 		{"https://example.com/script.js", true},

@@ -61,6 +61,15 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		return err
 	}
 
+	// Check sitemap for page count estimate
+	if info, err := FetchSitemap(startURL); err == nil && info.Count > 0 {
+		fmt.Printf("Sitemap has %d URLs", info.Count)
+		if info.Count > opts.MaxPages {
+			fmt.Printf(" (--max-pages is %d, use --max-pages %d to crawl all)", opts.MaxPages, info.Count)
+		}
+		fmt.Println()
+	}
+
 	// Create domain data directory
 	domainDir := filepath.Join(opts.DataDir, domain)
 	if err := os.MkdirAll(domainDir, 0755); err != nil {
@@ -68,6 +77,7 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	}
 
 	var pageCount int32
+	var limitWarned int32
 
 	// Allow the domain and all subdomains (handles www redirects and subdomain sites)
 	baseDomain := domain
@@ -150,19 +160,57 @@ func Crawl(startURL string, opts CrawlOptions) error {
 			return
 		}
 
-		// Only process HTML responses
+		pageURL := r.Request.URL.String()
+		start := time.Now()
 		contentType := strings.ToLower(r.Headers.Get("Content-Type"))
-		if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
+
+		// Save downloadable files (PDFs etc.) directly without HTML processing
+		ext := strings.ToLower(filepath.Ext(r.Request.URL.Path))
+		if downloadExtensions[ext] || strings.Contains(contentType, "application/pdf") || strings.HasPrefix(contentType, "image/") {
+			count := atomic.AddInt32(&pageCount, 1)
+			if int(count) > opts.MaxPages {
+				atomic.AddInt32(&pageCount, -1)
+				return
+			}
+			filePath := urlToFilePath(r.Request.URL)
+			savePath := filepath.Join(domainDir, filePath)
+			if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
+				fmt.Printf("  error creating dir for %s: %v\n", pageURL, err)
+				atomic.AddInt32(&pageCount, -1)
+				return
+			}
+			if err := os.WriteFile(savePath, r.Body, 0644); err != nil {
+				fmt.Printf("  error saving %s: %v\n", pageURL, err)
+				atomic.AddInt32(&pageCount, -1)
+				return
+			}
+			page := &storage.Page{
+				URL:       pageURL,
+				Domain:    domain,
+				Title:     filepath.Base(r.Request.URL.Path),
+				Status:    StatusCrawled,
+				Depth:     r.Request.Depth,
+				HTMLPath:  savePath,
+				CrawledAt: time.Now(),
+			}
+			_ = opts.DB.UpsertPage(page)
+			duration := time.Since(start).Milliseconds()
+			fmt.Printf("[%d/%d] %s  saved (%s)  %dms\n", count, opts.MaxPages, pageURL, ext, duration)
 			return
 		}
 
-		pageURL := r.Request.URL.String()
-		start := time.Now()
+		// Only process HTML responses
+		if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
+			return
+		}
 
 		// Atomically claim a slot before doing work
 		count := atomic.AddInt32(&pageCount, 1)
 		if int(count) > opts.MaxPages {
 			atomic.AddInt32(&pageCount, -1)
+			if atomic.CompareAndSwapInt32(&limitWarned, 0, 1) {
+				fmt.Printf("\nReached max-pages limit (%d). Use --max-pages to increase.\n", opts.MaxPages)
+			}
 			return
 		}
 
@@ -339,10 +387,16 @@ var skipPrefixes = []string{
 	"/cdn-cgi/",
 }
 
-// skipExtensions are file extensions that are not HTML pages.
+// downloadExtensions are file types we want to save (not HTML but still valuable).
+var downloadExtensions = map[string]bool{
+	".pdf": true,
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".svg": true, ".webp": true,
+}
+
+// skipExtensions are file extensions that are not useful to crawl.
 var skipExtensions = map[string]bool{
-	".pdf": true, ".zip": true, ".tar": true, ".gz": true, ".rar": true,
-	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".svg": true, ".webp": true, ".ico": true,
+	".zip": true, ".tar": true, ".gz": true, ".rar": true,
+	".ico": true,
 	".css": true, ".js": true, ".woff": true, ".woff2": true, ".ttf": true, ".eot": true,
 	".mp3": true, ".mp4": true, ".avi": true, ".mov": true, ".wmv": true,
 	".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true,
@@ -369,6 +423,7 @@ func shouldSkipURL(rawURL string) bool {
 	if ext != "" && skipExtensions[ext] {
 		return true
 	}
+	// downloadExtensions are allowed through (PDFs etc.)
 	return false
 }
 
@@ -411,6 +466,61 @@ func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// SitemapInfo holds parsed sitemap data.
+type SitemapInfo struct {
+	URL   string
+	URLs  []string
+	Count int
+}
+
+// FetchSitemap fetches and parses a site's sitemap.xml, returning the URLs found.
+func FetchSitemap(baseURL string) (*SitemapInfo, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	sitemapURL := fmt.Sprintf("%s://%s/sitemap.xml", parsed.Scheme, parsed.Host)
+	resp, err := httpClient.Get(sitemapURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch sitemap: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sitemap not found (HTTP %d)", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Simple XML parsing — extract all <loc> tags
+	content := string(body)
+	var urls []string
+	for {
+		start := strings.Index(content, "<loc>")
+		if start == -1 {
+			break
+		}
+		start += len("<loc>")
+		end := strings.Index(content[start:], "</loc>")
+		if end == -1 {
+			break
+		}
+		u := strings.TrimSpace(content[start : start+end])
+		if u != "" {
+			urls = append(urls, u)
+		}
+		content = content[start+end:]
+	}
+
+	return &SitemapInfo{
+		URL:   sitemapURL,
+		URLs:  urls,
+		Count: len(urls),
+	}, nil
+}
 
 func checkRobotsTxt(u *url.URL, autoYes bool) error {
 	robotsURL := fmt.Sprintf("%s://%s/robots.txt", u.Scheme, u.Host)
