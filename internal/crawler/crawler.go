@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,8 +69,14 @@ func Crawl(startURL string, opts CrawlOptions) error {
 
 	var pageCount int32
 
+	// Allow the domain and all subdomains (handles www redirects and subdomain sites)
+	baseDomain := domain
+	if strings.HasPrefix(domain, "www.") {
+		baseDomain = strings.TrimPrefix(domain, "www.")
+	}
+
 	c := colly.NewCollector(
-		colly.AllowedDomains(domain),
+		colly.URLFilters(regexp.MustCompile(`^https?://([a-zA-Z0-9-]+\.)*`+regexp.QuoteMeta(baseDomain)+`(/|$)`)),
 		colly.MaxDepth(opts.MaxDepth),
 	)
 
