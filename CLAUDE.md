@@ -26,13 +26,15 @@ Use **red/green TDD**:
 
 Always run `go test ./...` before committing. All new functionality must have tests.
 
-## Build and test
+## Build, test, and install
 
 ```bash
-go build ./...
-go test ./...
-make build          # build binary
-make build-all      # cross-compile all platforms
+go test ./...                              # run tests
+make build                                 # build binary
+make install                               # install to /usr/local/bin (needs sudo)
+make install INSTALL_DIR=~/.local/bin      # install to user dir
+make uninstall                             # remove from /usr/local/bin
+make build-all                             # cross-compile all platforms
 ```
 
 ## Key conventions

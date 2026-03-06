@@ -28,6 +28,7 @@ var rootCmd = &cobra.Command{
 	Short: "Crawl websites and convert them to Markdown",
 	Long: `web2md crawls websites, saves HTML pages, and optionally converts them to Markdown.
 Run with a URL to start crawling, or use subcommands for other operations.`,
+	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return cmd.Help()
