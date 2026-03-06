@@ -1,6 +1,8 @@
 BINARY_NAME=web2md
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
+COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
 
 INSTALL_DIR=/usr/local/bin
 
@@ -13,7 +15,7 @@ test:
 	go test ./...
 
 install: build
-	install -m 755 $(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
+	install -m 755 $(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME) 2>/dev/null || sudo install -m 755 $(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
 
 uninstall:
 	rm -f $(INSTALL_DIR)/$(BINARY_NAME)

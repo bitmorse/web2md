@@ -22,10 +22,10 @@ go install github.com/bitmorse/web2md@latest
 web2md https://example.com
 ```
 
-With Markdown conversion:
+HTML only (skip Markdown conversion):
 
 ```bash
-web2md https://example.com --convert-md
+web2md https://example.com --no-md
 ```
 
 ### Search crawled pages
@@ -44,9 +44,10 @@ web2md search "query" -d example.com
 | `--workers` | 2 | Concurrent workers |
 | `--min-delay` | 1s | Minimum delay between requests |
 | `--max-delay` | 3s | Maximum delay between requests |
-| `--convert-md` | false | Convert pages to Markdown |
+| `--no-md` | false | Skip Markdown conversion (save HTML only) |
 | `--smart-md` | false | Use readability with LLM fallback for Markdown conversion |
 | `--filter` | "" | LLM-powered page filter description |
+| `--recrawl` | false | Re-crawl pages that were already crawled |
 
 ### Search flags
 
@@ -64,7 +65,11 @@ web2md search "query" -d example.com
 
 ### Resume support
 
-Re-running a crawl on the same domain skips already-crawled URLs.
+Re-running a crawl on the same domain skips already-crawled URLs. Use `--recrawl` to force re-crawling:
+
+```bash
+web2md https://example.com --recrawl
+```
 
 ## Environment variables
 

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -37,6 +38,8 @@ type CrawlOptions struct {
 	ConvertMD bool
 	Filter    string
 	SmartMD   bool
+	Recrawl   bool
+	Yes       bool
 	DB        *storage.DB
 	DataDir   string
 }
@@ -50,10 +53,10 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	domain := parsed.Hostname()
 
 	// Check robots.txt and llms.txt
-	if err := checkRobotsTxt(parsed); err != nil {
+	if err := checkRobotsTxt(parsed, opts.Yes); err != nil {
 		return err
 	}
-	if err := checkLLMsTxt(parsed); err != nil {
+	if err := checkLLMsTxt(parsed, opts.Yes); err != nil {
 		return err
 	}
 
@@ -99,12 +102,40 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		atomic.StoreInt32(&stopped, 1)
 	}()
 
+	// Track normalized URLs to avoid crawling duplicates with different query params
+	visited := make(map[string]bool)
+	var visitedMu sync.Mutex
+
+	// Abort requests for already-crawled pages before the HTTP request is made
+	if !opts.Recrawl {
+		c.OnRequest(func(r *colly.Request) {
+			existing, _ := opts.DB.GetPage(r.URL.String())
+			if existing != nil && existing.Status == StatusCrawled {
+				fmt.Printf("  skipping %s (already crawled, use --recrawl to re-crawl)\n", r.URL)
+				r.Abort()
+			}
+		})
+	}
+
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		if atomic.LoadInt32(&stopped) != 0 || int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
 			return
 		}
-		link := e.Attr("href")
-		_ = e.Request.Visit(link)
+		link := e.Request.AbsoluteURL(e.Attr("href"))
+		if link == "" || shouldSkipURL(link) {
+			return
+		}
+		norm := normalizeURL(link)
+		visitedMu.Lock()
+		seen := visited[norm]
+		if !seen {
+			visited[norm] = true
+		}
+		visitedMu.Unlock()
+		if seen {
+			return
+		}
+		_ = e.Request.Visit(norm)
 	})
 
 	c.OnResponse(func(r *colly.Response) {
@@ -112,16 +143,14 @@ func Crawl(startURL string, opts CrawlOptions) error {
 			return
 		}
 
-		pageURL := r.Request.URL.String()
-		start := time.Now()
-
-		// Resume: skip already-crawled pages
-		existing, _ := opts.DB.GetPage(pageURL)
-		if existing != nil && existing.Status == StatusCrawled {
-			fmt.Printf("[%d/%d] %s  %s (already crawled)\n",
-				atomic.LoadInt32(&pageCount), opts.MaxPages, pageURL, StatusSkipped)
+		// Only process HTML responses
+		contentType := strings.ToLower(r.Headers.Get("Content-Type"))
+		if !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
 			return
 		}
+
+		pageURL := r.Request.URL.String()
+		start := time.Now()
 
 		// Atomically claim a slot before doing work
 		count := atomic.AddInt32(&pageCount, 1)
@@ -230,8 +259,26 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		fmt.Printf("[%d/%d] %s  %s  %dms\n", count, opts.MaxPages, pageURL, status, duration)
 	})
 
+	// Retry with exponential backoff (max 3 attempts)
+	const maxRetries = 3
+	retryCount := make(map[string]int)
+	var retryMu sync.Mutex
+
 	c.OnError(func(r *colly.Response, err error) {
-		fmt.Printf("  error fetching %s: %v\n", r.Request.URL, err)
+		u := r.Request.URL.String()
+		retryMu.Lock()
+		count := retryCount[u]
+		retryCount[u] = count + 1
+		retryMu.Unlock()
+
+		if count < maxRetries && r.StatusCode >= 500 {
+			backoff := time.Duration(1<<uint(count)) * time.Second
+			fmt.Printf("  retrying %s in %v (attempt %d/%d): %v\n", u, backoff, count+1, maxRetries, err)
+			time.Sleep(backoff)
+			_ = r.Request.Retry()
+		} else {
+			fmt.Printf("  error fetching %s: %v\n", u, err)
+		}
 	})
 
 	if err := c.Visit(startURL); err != nil {
@@ -280,6 +327,59 @@ func extractTitle(html string) string {
 	return strings.TrimSpace(html[start : start+end])
 }
 
+// skipPrefixes are URL path prefixes that should never be crawled.
+var skipPrefixes = []string{
+	"/cdn-cgi/",
+}
+
+// skipExtensions are file extensions that are not HTML pages.
+var skipExtensions = map[string]bool{
+	".pdf": true, ".zip": true, ".tar": true, ".gz": true, ".rar": true,
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".svg": true, ".webp": true, ".ico": true,
+	".css": true, ".js": true, ".woff": true, ".woff2": true, ".ttf": true, ".eot": true,
+	".mp3": true, ".mp4": true, ".avi": true, ".mov": true, ".wmv": true,
+	".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true,
+	".xml": true, ".json": true, ".csv": true,
+}
+
+// shouldSkipURL returns true for URLs that should not be crawled.
+func shouldSkipURL(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	if strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "mailto:") ||
+		strings.HasPrefix(lower, "tel:") || strings.HasPrefix(lower, "data:") {
+		return true
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	for _, prefix := range skipPrefixes {
+		if strings.HasPrefix(u.Path, prefix) {
+			return true
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(u.Path))
+	if ext != "" && skipExtensions[ext] {
+		return true
+	}
+	return false
+}
+
+// normalizeURL strips query params, fragments, and trailing slashes for dedup.
+func normalizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	// Strip trailing slash (except for root path)
+	if u.Path != "/" {
+		u.Path = strings.TrimRight(u.Path, "/")
+	}
+	return u.String()
+}
+
 // proxyTransport rewrites the request URL to go through a proxy service
 // (e.g. crawlbase) while preserving colly's original URL for dedup/filtering.
 type proxyTransport struct {
@@ -305,7 +405,7 @@ func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-func checkRobotsTxt(u *url.URL) error {
+func checkRobotsTxt(u *url.URL, autoYes bool) error {
 	robotsURL := fmt.Sprintf("%s://%s/robots.txt", u.Scheme, u.Host)
 	resp, err := httpClient.Get(robotsURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -330,18 +430,22 @@ func checkRobotsTxt(u *url.URL) error {
 	}
 	if hasBlanketDisallow {
 		fmt.Printf("robots.txt at %s contains 'Disallow: /'\n", robotsURL)
-		fmt.Print("The site may restrict crawling. Continue anyway? [y/N]: ")
-		reader := bufio.NewReader(os.Stdin)
-		answer, _ := reader.ReadString('\n')
-		answer = strings.TrimSpace(strings.ToLower(answer))
-		if answer != "y" && answer != "yes" {
-			return fmt.Errorf("crawling aborted by user due to robots.txt")
+		if autoYes {
+			fmt.Println("Continuing (--yes)")
+		} else {
+			fmt.Print("The site may restrict crawling. Continue anyway? [y/N]: ")
+			reader := bufio.NewReader(os.Stdin)
+			answer, _ := reader.ReadString('\n')
+			answer = strings.TrimSpace(strings.ToLower(answer))
+			if answer != "y" && answer != "yes" {
+				return fmt.Errorf("crawling aborted by user due to robots.txt")
+			}
 		}
 	}
 	return nil
 }
 
-func checkLLMsTxt(u *url.URL) error {
+func checkLLMsTxt(u *url.URL, autoYes bool) error {
 	llmsURL := fmt.Sprintf("%s://%s/llms.txt", u.Scheme, u.Host)
 	resp, err := httpClient.Get(llmsURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -355,12 +459,16 @@ func checkLLMsTxt(u *url.URL) error {
 	}
 
 	fmt.Printf("llms.txt found at %s:\n%s\n", llmsURL, string(body))
-	fmt.Print("Continue crawling? [y/N]: ")
-	reader := bufio.NewReader(os.Stdin)
-	answer, _ := reader.ReadString('\n')
-	answer = strings.TrimSpace(strings.ToLower(answer))
-	if answer != "y" && answer != "yes" {
-		return fmt.Errorf("crawling aborted by user due to llms.txt")
+	if autoYes {
+		fmt.Println("Continuing (--yes)")
+	} else {
+		fmt.Print("Continue crawling? [y/N]: ")
+		reader := bufio.NewReader(os.Stdin)
+		answer, _ := reader.ReadString('\n')
+		answer = strings.TrimSpace(strings.ToLower(answer))
+		if answer != "y" && answer != "yes" {
+			return fmt.Errorf("crawling aborted by user due to llms.txt")
+		}
 	}
 	return nil
 }
