@@ -114,8 +114,13 @@ Answer with only "yes" or "no".`,
 	return bytes.HasPrefix(lower, []byte("yes")), nil
 }
 
+const maxHTMLLen = 100000 // ~100KB limit for LLM input
+
 // ConvertToMarkdown asks the LLM to convert HTML to clean Markdown.
 func ConvertToMarkdown(html string) (string, error) {
+	if len(html) > maxHTMLLen {
+		html = html[:maxHTMLLen]
+	}
 	prompt := fmt.Sprintf(
 		`Convert the following HTML to clean, readable Markdown. Return only the Markdown content, no explanations.
 

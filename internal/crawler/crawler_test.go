@@ -17,6 +17,10 @@ func TestURLToFilePath(t *testing.T) {
 		{"https://example.com/style.css", "style.css"},
 		{"https://example.com/image.png", "image.png"},
 		{"https://example.com/page/", "page/index.html"},
+		// Path traversal attempts should be sanitized
+		{"https://example.com/../../etc/passwd", "index.html"},
+		{"https://example.com/../secret", "index.html"},
+		{"https://example.com/a/b/../../c", "c.html"},
 	}
 
 	for _, tt := range tests {

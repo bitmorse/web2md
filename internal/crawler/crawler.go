@@ -82,32 +82,25 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	}
 
 	if proxyURL := os.Getenv("PROXY_BASE_URL"); proxyURL != "" {
-		c.OnRequest(func(r *colly.Request) {
-			orig := r.URL.String()
-			separator := "&"
-			if !strings.Contains(proxyURL, "?") {
-				separator = "?"
-			}
-			newURL := proxyURL + separator + "url=" + orig
-			parsed, err := url.Parse(newURL)
-			if err == nil {
-				r.URL = parsed
-			}
+		transport := &http.Transport{}
+		c.WithTransport(&proxyTransport{
+			base:     transport,
+			proxyURL: proxyURL,
 		})
 	}
 
-	// Handle Ctrl+C
+	// Handle Ctrl+C — set a flag so the crawler stops accepting new pages
+	var stopped int32
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		fmt.Println("\nInterrupted. Stopping crawler...")
-		c.Wait()
-		os.Exit(0)
+		fmt.Println("\nInterrupted. Finishing in-flight requests...")
+		atomic.StoreInt32(&stopped, 1)
 	}()
 
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		if int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
+		if atomic.LoadInt32(&stopped) != 0 || int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
 			return
 		}
 		link := e.Attr("href")
@@ -115,7 +108,7 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	})
 
 	c.OnResponse(func(r *colly.Response) {
-		if int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
+		if atomic.LoadInt32(&stopped) != 0 || int(atomic.LoadInt32(&pageCount)) >= opts.MaxPages {
 			return
 		}
 
@@ -130,6 +123,13 @@ func Crawl(startURL string, opts CrawlOptions) error {
 			return
 		}
 
+		// Atomically claim a slot before doing work
+		count := atomic.AddInt32(&pageCount, 1)
+		if int(count) > opts.MaxPages {
+			atomic.AddInt32(&pageCount, -1)
+			return
+		}
+
 		htmlContent := string(r.Body)
 		title := extractTitle(htmlContent)
 
@@ -138,16 +138,16 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		htmlFilePath := filepath.Join(domainDir, filePath)
 		if err := os.MkdirAll(filepath.Dir(htmlFilePath), 0755); err != nil {
 			fmt.Printf("  error creating dir: %v\n", err)
+			atomic.AddInt32(&pageCount, -1)
 			return
 		}
 
 		// Save HTML
 		if err := os.WriteFile(htmlFilePath, r.Body, 0644); err != nil {
 			fmt.Printf("  error saving HTML: %v\n", err)
+			atomic.AddInt32(&pageCount, -1)
 			return
 		}
-
-		count := atomic.AddInt32(&pageCount, 1)
 		status := StatusCrawled
 		filterReason := ""
 
@@ -181,12 +181,20 @@ func Crawl(startURL string, opts CrawlOptions) error {
 			var mdContent string
 			var convErr error
 
-			if opts.SmartMD {
-				mdContent, convErr = llm.ConvertToMarkdown(htmlContent)
-				mdMethod = "llm"
-			} else {
-				mdContent, convErr = converter.Convert(htmlContent, pageURL)
-				mdMethod = "readability"
+			// Always try readability first
+			mdContent, convErr = converter.Convert(htmlContent, pageURL)
+			mdMethod = "readability"
+
+			// With --smart-md, fall back to LLM if readability extracted too little
+			if opts.SmartMD && (convErr != nil || len(strings.TrimSpace(mdContent)) < 100) {
+				llmContent, llmErr := llm.ConvertToMarkdown(htmlContent)
+				if llmErr == nil {
+					mdContent = llmContent
+					mdMethod = "llm"
+					convErr = nil
+				} else if convErr != nil {
+					convErr = llmErr
+				}
 			}
 
 			if convErr != nil {
@@ -226,7 +234,12 @@ func Crawl(startURL string, opts CrawlOptions) error {
 		fmt.Printf("  error fetching %s: %v\n", r.Request.URL, err)
 	})
 
-	return c.Visit(startURL)
+	if err := c.Visit(startURL); err != nil {
+		return err
+	}
+	c.Wait()
+	signal.Stop(sigChan)
+	return nil
 }
 
 // urlToFilePath converts a URL path to a local file path.
@@ -236,9 +249,14 @@ func urlToFilePath(u *url.URL) string {
 		return "index.html"
 	}
 	p = strings.TrimPrefix(p, "/")
-	// Trailing slash means directory index
-	if strings.HasSuffix(p, "/") {
-		return p + "index.html"
+	// Sanitize: clean the path and reject traversal attempts
+	p = filepath.Clean(p)
+	if p == "." || strings.HasPrefix(p, "..") || filepath.IsAbs(p) {
+		return "index.html"
+	}
+	// Trailing slash means directory index (check original before Clean)
+	if strings.HasSuffix(u.Path, "/") {
+		return p + "/index.html"
 	}
 	// Only add .html if there's no existing file extension
 	if ext := filepath.Ext(p); ext == "" {
@@ -262,9 +280,34 @@ func extractTitle(html string) string {
 	return strings.TrimSpace(html[start : start+end])
 }
 
+// proxyTransport rewrites the request URL to go through a proxy service
+// (e.g. crawlbase) while preserving colly's original URL for dedup/filtering.
+type proxyTransport struct {
+	base     http.RoundTripper
+	proxyURL string
+}
+
+func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	orig := req.URL.String()
+	separator := "&"
+	if !strings.Contains(t.proxyURL, "?") {
+		separator = "?"
+	}
+	proxied, err := url.Parse(t.proxyURL + separator + "url=" + url.QueryEscape(orig))
+	if err != nil {
+		return nil, err
+	}
+	req = req.Clone(req.Context())
+	req.URL = proxied
+	req.Host = proxied.Host
+	return t.base.RoundTrip(req)
+}
+
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
 func checkRobotsTxt(u *url.URL) error {
 	robotsURL := fmt.Sprintf("%s://%s/robots.txt", u.Scheme, u.Host)
-	resp, err := http.Get(robotsURL)
+	resp, err := httpClient.Get(robotsURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return nil
 	}
@@ -276,7 +319,16 @@ func checkRobotsTxt(u *url.URL) error {
 	}
 
 	content := string(body)
-	if strings.Contains(content, "Disallow: /") {
+	// Check for blanket disallow (Disallow: / followed by end-of-line or EOF)
+	hasBlanketDisallow := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Disallow: /" {
+			hasBlanketDisallow = true
+			break
+		}
+	}
+	if hasBlanketDisallow {
 		fmt.Printf("robots.txt at %s contains 'Disallow: /'\n", robotsURL)
 		fmt.Print("The site may restrict crawling. Continue anyway? [y/N]: ")
 		reader := bufio.NewReader(os.Stdin)
@@ -291,7 +343,7 @@ func checkRobotsTxt(u *url.URL) error {
 
 func checkLLMsTxt(u *url.URL) error {
 	llmsURL := fmt.Sprintf("%s://%s/llms.txt", u.Scheme, u.Host)
-	resp, err := http.Get(llmsURL)
+	resp, err := httpClient.Get(llmsURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return nil
 	}

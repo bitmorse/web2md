@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -114,8 +115,12 @@ func (d *DB) GetPage(url string) (*Page, error) {
 
 func (d *DB) UpsertPage(page *Page) error {
 	_, err := d.db.Exec(
-		`INSERT OR REPLACE INTO pages (url, domain, title, status, depth, html_path, md_path, md_method, crawled_at, filter_reason)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO pages (url, domain, title, status, depth, html_path, md_path, md_method, crawled_at, filter_reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(url) DO UPDATE SET
+			domain=excluded.domain, title=excluded.title, status=excluded.status,
+			depth=excluded.depth, html_path=excluded.html_path, md_path=excluded.md_path,
+			md_method=excluded.md_method, crawled_at=excluded.crawled_at, filter_reason=excluded.filter_reason`,
 		page.URL, page.Domain, page.Title, page.Status, page.Depth,
 		page.HTMLPath, page.MDPath, page.MDMethod, page.CrawledAt, page.FilterReason,
 	)
@@ -138,6 +143,9 @@ func (d *DB) Search(query string, domain string, limit int) ([]SearchResult, err
 		err  error
 	)
 
+	// Quote each term so FTS5 special characters are treated as literals
+	ftsQuery := quoteFTSQuery(query)
+
 	baseQuery := `SELECT f.rowid, f.url, f.domain, f.title, p.crawled_at,
 		snippet(pages_fts, 3, '', '', '...', 30)
 		FROM pages_fts f
@@ -147,10 +155,10 @@ func (d *DB) Search(query string, domain string, limit int) ([]SearchResult, err
 	if domain != "" {
 		baseQuery += ` AND f.domain = ?`
 		baseQuery += ` ORDER BY rank LIMIT ?`
-		rows, err = d.db.Query(baseQuery, query, domain, limit)
+		rows, err = d.db.Query(baseQuery, ftsQuery, domain, limit)
 	} else {
 		baseQuery += ` ORDER BY rank LIMIT ?`
-		rows, err = d.db.Query(baseQuery, query, limit)
+		rows, err = d.db.Query(baseQuery, ftsQuery, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -170,6 +178,17 @@ func (d *DB) Search(query string, domain string, limit int) ([]SearchResult, err
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// quoteFTSQuery wraps each word in double quotes so FTS5 operators
+// (AND, OR, NOT, NEAR, *, etc.) are treated as literal search terms.
+func quoteFTSQuery(query string) string {
+	words := strings.Fields(query)
+	for i, w := range words {
+		escaped := strings.ReplaceAll(w, `"`, `""`)
+		words[i] = `"` + escaped + `"`
+	}
+	return strings.Join(words, " ")
 }
 
 func (d *DB) CountPages(domain string) (int, error) {
