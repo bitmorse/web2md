@@ -77,8 +77,7 @@ func migrate(db *sql.DB) error {
 
 	_, err = db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
-			url, domain, title, body,
-			content=pages, content_rowid=id
+			url UNINDEXED, domain UNINDEXED, title, body
 		)
 	`)
 	if err != nil {
@@ -124,6 +123,8 @@ func (d *DB) UpsertPage(page *Page) error {
 }
 
 func (d *DB) InsertFTS(id int64, url, domain, title, body string) error {
+	// Delete any existing entry first (for resume/update scenarios)
+	_, _ = d.db.Exec(`DELETE FROM pages_fts WHERE rowid = ?`, id)
 	_, err := d.db.Exec(
 		`INSERT INTO pages_fts(rowid, url, domain, title, body) VALUES(?, ?, ?, ?, ?)`,
 		id, url, domain, title, body,
@@ -137,14 +138,14 @@ func (d *DB) Search(query string, domain string, limit int) ([]SearchResult, err
 		err  error
 	)
 
-	baseQuery := `SELECT pages.id, pages.url, pages.domain, pages.title, pages.crawled_at,
+	baseQuery := `SELECT f.rowid, f.url, f.domain, f.title, p.crawled_at,
 		snippet(pages_fts, 3, '', '', '...', 30)
-		FROM pages_fts
-		JOIN pages ON pages.id = pages_fts.rowid
+		FROM pages_fts f
+		LEFT JOIN pages p ON p.url = f.url
 		WHERE pages_fts MATCH ?`
 
 	if domain != "" {
-		baseQuery += ` AND pages.domain = ?`
+		baseQuery += ` AND f.domain = ?`
 		baseQuery += ` ORDER BY rank LIMIT ?`
 		rows, err = d.db.Query(baseQuery, query, domain, limit)
 	} else {

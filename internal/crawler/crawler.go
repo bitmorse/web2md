@@ -82,9 +82,18 @@ func Crawl(startURL string, opts CrawlOptions) error {
 	}
 
 	if proxyURL := os.Getenv("PROXY_BASE_URL"); proxyURL != "" {
-		if err := c.SetProxy(proxyURL); err != nil {
-			return fmt.Errorf("set proxy: %w", err)
-		}
+		c.OnRequest(func(r *colly.Request) {
+			orig := r.URL.String()
+			separator := "&"
+			if !strings.Contains(proxyURL, "?") {
+				separator = "?"
+			}
+			newURL := proxyURL + separator + "url=" + orig
+			parsed, err := url.Parse(newURL)
+			if err == nil {
+				r.URL = parsed
+			}
+		})
 	}
 
 	// Handle Ctrl+C
@@ -227,6 +236,10 @@ func urlToFilePath(u *url.URL) string {
 		return "index.html"
 	}
 	p = strings.TrimPrefix(p, "/")
+	// Trailing slash means directory index
+	if strings.HasSuffix(p, "/") {
+		return p + "index.html"
+	}
 	// Only add .html if there's no existing file extension
 	if ext := filepath.Ext(p); ext == "" {
 		p = p + ".html"

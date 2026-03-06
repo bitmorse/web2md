@@ -10,18 +10,18 @@ import (
 )
 
 func baseURL() string {
-	if v := os.Getenv("LLM_BASE_URL"); v != "" {
+	if v := os.Getenv("OPENAI_BASE_URL"); v != "" {
 		return v
 	}
 	return "https://api.openai.com/v1"
 }
 
 func apiKey() string {
-	return os.Getenv("LLM_API_KEY")
+	return os.Getenv("OPENAI_API_KEY")
 }
 
 func model() string {
-	if v := os.Getenv("LLM_MODEL"); v != "" {
+	if v := os.Getenv("OPENAI_MODEL"); v != "" {
 		return v
 	}
 	return "gpt-4o-mini"

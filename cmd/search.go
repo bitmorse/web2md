@@ -84,8 +84,8 @@ var searchCmd = &cobra.Command{
 }
 
 func init() {
-	searchCmd.Flags().StringVar(&searchDomain, "domain", "", "Filter results by domain")
-	searchCmd.Flags().IntVar(&searchLimit, "limit", 10, "Maximum number of results")
+	searchCmd.Flags().StringVarP(&searchDomain, "domain", "d", "", "Filter results by domain")
+	searchCmd.Flags().IntVar(&searchLimit, "limit", 20, "Maximum number of results")
 }
 
 func printBoxTop() {

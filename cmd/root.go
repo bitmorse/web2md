@@ -42,8 +42,9 @@ Run with a URL to start crawling, or use subcommands for other operations.`,
 		if err != nil {
 			return fmt.Errorf("get home dir: %w", err)
 		}
-		dataDir := filepath.Join(homeDir, ".web2md")
-		dbPath := filepath.Join(dataDir, "db.sqlite")
+		baseDir := filepath.Join(homeDir, ".web2md")
+		dataDir := filepath.Join(baseDir, "data")
+		dbPath := filepath.Join(baseDir, "db.sqlite")
 
 		db, err := storage.New(dbPath)
 		if err != nil {
